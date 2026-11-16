@@ -1,225 +1,72 @@
-// Boot and the one loop: a fixed 60 Hz simulation feeding a render at the display's rate.
-// ?shot=start|play|end with &seed=N sets up a deterministic frame for a capture, renders it
-// twice, then freezes it and sets window.__shotReady.
-import * as THREE from 'three';
-import { PALETTE } from './palette.js';
-import { createWorld } from './world.js';
-import { createInput } from './input.js';
-import { createPlayer } from './player.js';
-import { createWeapon } from './weapon.js';
-import { createTargets } from './targets.js';
+// Ninefold Relay — boot and a 60 Hz simulation. Rendering cannot alter game outcomes.
+import { STEP } from './config.js';
+import { mulberry32 } from './random.js';
+import { createMap } from './map.js';
+import { createActor, stepPlayer } from './player.js';
+import { createCombat } from './weapon.js';
+import { stepBots } from './bots.js';
+import { createRounds } from './round.js';
 import { createHud } from './hud.js';
-
-const FIXED_STEP = 1 / 60;
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seed = Number.parseInt(params.get('seed') ?? '1', 10) || 1;
-
-function mulberry32(initial) {
-  let a = initial;
-  return function random() {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const random = mulberry32(seed);
-
-const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
-renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-document.getElementById('game').appendChild(renderer.domElement);
-
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(PALETTE.canvas);
-scene.fog = new THREE.Fog(new THREE.Color(PALETTE.canvas), 18, 46);
-const camera = new THREE.PerspectiveCamera(74, window.innerWidth / window.innerHeight, 0.05, 140);
-scene.add(camera);
-
-const world = createWorld(scene);
-const targets = createTargets(scene);
-const weapon = createWeapon(camera);
-const hud = createHud();
-const player = createPlayer(world.colliders);
-const input = createInput(renderer.domElement, onLockChange);
-const raycaster = new THREE.Raycaster();
-raycaster.far = 80;
-const shootables = world.shootables.concat(targets.hitMeshes);
-const direction = new THREE.Vector3();
-
-const body = player.state;
-const markerHoldMs = shot ? 4000 : 90;
-let score = 0;
-let elapsed = 0;
-let cleared = false;
-let frozen = false;
-let started = false;
-let accumulator = 0;
-let lastTime = performance.now();
-
-hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-hud.setScore(0);
-hud.onPlay(() => {
-  if (shot) return;
-  if (cleared) restart();
-  input.requestLock();
-});
-
-function restart() {
-  cleared = false;
-  score = 0;
-  elapsed = 0;
-  targets.reset();
-  weapon.refill();
-  hud.setScore(0);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-}
-
-function onLockChange(locked) {
-  if (shot) return;
-  if (locked) {
-    started = true;
-    hud.hideOverlay();
-  } else if (!cleared) {
-    hud.showOverlay(started ? 'paused' : 'start', score);
+import { createRender } from './render.js';
+import { createEffects } from './effects.js';
+import { createAudio } from './audio.js';
+import { createInput } from './input.js';
+import { stageShot } from './shots.js';
+const params=new URLSearchParams(location.search),seed=Number.parseInt(params.get('seed')||'1',10)||1;
+const map=createMap(),effects=createEffects(),audio=createAudio();
+const s={seed,rng:mulberry32(seed),time:0,phase:'title',paused:false,buyOpen:false,scoreboard:false,round:1,timer:95,buyLeft:8,score:[0,0],history:[],feed:[],reason:'',winner:0,roundLeft:0,deathSerial:0,actors:[],player:null,bomb:{planted:false,carrier:0,dropped:false,x:0,z:17,site:'',fuse:40,progress:0,defuse:0,beep:0,planter:-1,defuser:-1},grenades:Array.from({length:8},()=>({active:false,x:0,y:0,z:0,vx:0,vy:0,vz:0,fuse:0,owner:0})),view:{kick:0,flash:0,shake:0},hit:0,headhit:false,hurt:0,spread:.002,mode:'AUTO',shot:params.get('shot'),cameraOverride:null,effects,audio,noise:null,hud:null};
+for(let id=0;id<10;id++)s.actors.push(createActor(id,map.spawns[id]));s.player=s.actors[0];audio.setListener(s.player);
+s.noise=(a,radius)=>{for(const b of s.actors)if(b.alive&&b.team!==a.team&&Math.hypot(b.position.x-a.position.x,b.position.z-a.position.z)<radius){b.lastX=a.position.x;b.lastZ=a.position.z;b.memory=Math.max(b.memory,3.5);b.heard=s.time;}};
+const render=createRender(map,s,effects);document.getElementById('game').appendChild(render.canvas);render.resize();
+const input=createInput(render.canvas,locked=>{if(s.shot)return;if(!locked&&s.phase!=='title'&&s.phase!=='end')s.paused=true;else if(locked)s.paused=false;});
+const combat=createCombat(s,map),rounds=createRounds(s,map,combat,input.state);
+function play(){audio.start();if(s.phase==='title'||s.phase==='end')rounds.restart();s.paused=false;input.requestLock();}
+s.hud=createHud(s,{play,buy:rounds.buy,closeBuy(){s.buyOpen=false;},restart:play});
+function controls(){
+  const i=input.state,p=s.player,keys=i.pressed;s.scoreboard=i.keys.has('Tab');
+  if(keys.has('Enter')&&(s.phase==='title'||s.phase==='end'||s.paused))play();
+  if(keys.has('KeyB')&&rounds.canBuy())s.buyOpen=!s.buyOpen;
+  if(keys.has('Escape'))s.buyOpen=false;
+  if(s.buyOpen){for(let n=1;n<=5;n++)if(keys.has('Digit'+n))rounds.buy(n-1);}
+  else {
+    if(keys.has('KeyQ'))combat.switchWeapon(p,p.weapon==='patern'&&p.primary?p.primary:'patern');
+    if(keys.has('Digit1')&&p.primary)combat.switchWeapon(p,p.primary);
+    if(keys.has('Digit2'))combat.switchWeapon(p,'patern');
+    if(keys.has('KeyR'))combat.reload(p);
+    if(keys.has('KeyG'))combat.grenade(p);
+    if(keys.has('KeyV')){s.mode=s.mode==='AUTO'?'BURST':'AUTO';p.burst=0;}
   }
+  keys.clear();
 }
-
-function syncCamera() {
-  camera.position.set(body.position.x, body.position.y + body.eye, body.position.z);
-  camera.rotation.set(body.pitch, body.yaw, 0, 'YXZ');
-}
-
-function aimAt(point) {
-  const dx = point.x - body.position.x;
-  const dy = point.y - (body.position.y + body.eye);
-  const dz = point.z - body.position.z;
-  const length = Math.hypot(dx, dy, dz) || 1;
-  body.yaw = Math.atan2(-dx, -dz);
-  body.pitch = Math.asin(Math.max(-1, Math.min(1, dy / length)));
-  syncCamera();
-}
-
-function shoot(spread) {
-  if (!weapon.takeRound()) return false;
-  camera.getWorldDirection(direction);
-  direction.x += (random() * 2 - 1) * spread;
-  direction.y += (random() * 2 - 1) * spread;
-  direction.z += (random() * 2 - 1) * spread;
-  direction.normalize();
-  scene.updateMatrixWorld(true);
-  raycaster.set(camera.position, direction);
-  const hit = raycaster.intersectObjects(shootables, false)[0];
-  if (hit && hit.object.userData.target) {
-    const killed = targets.damage(hit.object, hit.object.userData.part === 'head' ? 100 : 34);
-    score += killed ? 100 : 10;
-    hud.setScore(score);
-    hud.hitMarker(killed, markerHoldMs);
-    if (targets.remaining() === 0 && !cleared) {
-      cleared = true;
-      hud.showOverlay('end', score);
-      if (document.pointerLockElement) document.exitPointerLock();
+function step(dt){
+  controls();
+  if(s.paused||s.phase==='title'||s.phase==='end')return;
+  s.time+=dt;s.hit=Math.max(0,s.hit-dt);s.hurt=Math.max(0,s.hurt-dt);
+  combat.step(dt);effects.step(dt);
+  if(s.phase==='playing'){
+    if(s.player.alive){
+      stepPlayer(s,input.state,map,dt);
+      const a=s.player,fire=input.state.firing&&!s.buyOpen&&!input.state.keys.has('KeyE');
+      if(a.weapon==='kestrel'&&s.mode==='BURST'){
+        if(fire&&!a.trigger)a.burst=3;
+        if(a.burst>0&&combat.fire(a)){a.burst--;if(!a.burst)a.cooldown=.3;}
+      }else if(fire&&(a.weapon!=='patern'||!a.trigger))combat.fire(a);
+      a.trigger=fire;
     }
+    stepBots(s,map,dt,combat);
   }
-  weapon.pullTrigger();
-  player.recoil(0.009 + random() * 0.004, (random() * 2 - 1) * 0.004);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-  return true;
+  rounds.step(dt);s.spread=combat.spread(s.player);s.view.kick=s.player.recoil;s.view.shake=s.hurt*.2;
 }
-
-function step(dt) {
-  elapsed += dt;
-  player.step(dt, input.state.keys);
-  weapon.step(dt);
-  targets.step(dt, elapsed);
+// Small public inspection surface for deterministic browser checks, not a second game state.
+window.__game={state:s,map,input:input.state,step(n=1){for(let i=0;i<n;i++)step(STEP);render.draw();s.hud.draw();},start(){rounds.restart();s.buyOpen=false;},combat,rounds};
+window.addEventListener('resize',render.resize);
+let previous=performance.now(),accumulator=0;
+function frame(now){
+  const elapsed=Math.max(0,(now-previous)/1000);previous=now;
+  // Never drop accumulated ticks on slow frames. Catch-up changes presentation, not results.
+  if(!s.shot){accumulator+=elapsed;let budget=0;while(accumulator>=STEP&&budget<240){step(STEP);accumulator-=STEP;budget++;}}
+  render.draw();s.hud.draw();requestAnimationFrame(frame);
 }
-
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dt = Math.min((now - lastTime) / 1000, 0.1);
-  lastTime = now;
-  if (!frozen) {
-    const look = input.takeLook();
-    player.look(look.x, look.y);
-    if (input.state.firing && weapon.ready()) shoot(shot ? 0 : weapon.spread(player.groundSpeed()));
-    if (input.state.keys.has('KeyR')) weapon.reload();
-    accumulator += dt;
-    let steps = 0;
-    while (accumulator >= FIXED_STEP && steps < 5) {
-      step(FIXED_STEP);
-      accumulator -= FIXED_STEP;
-      steps += 1;
-    }
-    if (accumulator > FIXED_STEP * 5) accumulator = 0;
-    syncCamera();
-  }
-  renderer.render(scene, camera);
-}
-
-function settle(steps) {
-  for (let index = 0; index < steps; index += 1) step(FIXED_STEP);
-}
-
-function runShot(name) {
-  hud.hideOverlay();
-  body.pitch = 0;
-  body.yaw = 0;
-  if (name === 'play' || name === 'end') {
-    body.position.set(0, 0, -5);
-    settle(20);
-    const count = name === 'play' ? 1 : targets.items.length;
-    for (let index = 0; index < count; index += 1) {
-      const point = targets.aimPoint(index);
-      for (let round = 0; round < 3; round += 1) {
-        aimAt(point);
-        shoot(0);
-        if (round < 2) settle(8);
-      }
-    }
-    if (name === 'play') {
-      settle(12);
-      aimAt(targets.aimPoint(1));
-      shoot(0);
-      settle(1);
-    } else {
-      settle(40);
-    }
-  } else {
-    body.position.set(0.6, 0, 8.6);
-    settle(20);
-    aimAt(new THREE.Vector3(0, 1.5, -6));
-    hud.showOverlay('start', 0);
-  }
-  hud.setScore(score);
-  hud.setAmmo(weapon.state.mag, weapon.state.reserve);
-  paintTwiceThenReady();
-}
-
-function paintTwiceThenReady() {
-  let painted = 0;
-  function paint() {
-    requestAnimationFrame(paint);
-    syncCamera();
-    renderer.render(scene, camera);
-    painted += 1;
-    if (painted === 2) {
-      window.__shotReady = true;
-      frozen = true;
-    }
-  }
-  requestAnimationFrame(paint);
-}
-
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
-
-syncCamera();
-if (shot) runShot(shot);
-else requestAnimationFrame(frame);
+if(s.shot){stageShot(s,map,combat,rounds);render.draw();s.hud.draw();requestAnimationFrame(()=>{render.draw();s.hud.draw();requestAnimationFrame(()=>{render.draw();window.__shotReady=true;});});}
+else s.hud.updateStatus('Ninefold Relay. Deploy as an Attacker. Plant at A or B.');
+requestAnimationFrame(frame);
