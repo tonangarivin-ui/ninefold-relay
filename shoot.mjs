@@ -14,7 +14,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const server = spawn(process.execPath, [join(repo, 'serve.ts'), '--port', String(PORT)], { cwd: repo, stdio: 'ignore' });
 const browser = spawn(process.env.CHROME ?? '/home/ubuntu/.local/bin/chromium', [
   '--headless=new', `--remote-debugging-port=${CDP}`, '--no-sandbox', '--disable-gpu',
-  '--hide-scrollbars', '--user-data-dir=/tmp/shoot-profile', 'about:blank',
+  '--hide-scrollbars', '--window-size=1280,720', '--force-device-scale-factor=1', '--user-data-dir=/tmp/shoot-profile', 'about:blank',
 ], { stdio: 'ignore' });
 
 let ws;
